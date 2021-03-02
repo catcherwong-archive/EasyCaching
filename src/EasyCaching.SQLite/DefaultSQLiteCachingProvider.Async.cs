@@ -51,33 +51,25 @@
             });
 
             var dbResult = list.FirstOrDefault();
+            var result = Deserialize<T>(cacheKey, dbResult);
+            TrackCacheStats(cacheKey, result);
 
-            if (!string.IsNullOrWhiteSpace(dbResult))
-            {
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Hit : cachekey = {cacheKey}");
-
-                CacheStats.OnHit();
-
-                return new CacheValue<T>(Newtonsoft.Json.JsonConvert.DeserializeObject<T>(dbResult), true);
-            }
-
-            CacheStats.OnMiss();
-
-            if (_options.EnableLogging)
-                _logger?.LogInformation($"Cache Missed : cachekey = {cacheKey}");
+            if (result.HasValue)
+                return result;
 
             var item = await dataRetriever?.Invoke();
 
             if (item != null || _options.CacheNulls)
             {
                 await SetAsync(cacheKey, item, expiration);
-                return new CacheValue<T>(item, true);
+                result = new CacheValue<T>(item, true);
             }
             else
             {
-                return CacheValue<T>.NoValue;
+                result = CacheValue<T>.NoValue;
             }
+
+            return result;
         }
 
         /// <summary>
@@ -97,25 +89,10 @@
             });
 
             var dbResult = list.FirstOrDefault();
+            var result = Deserialize<T>(cacheKey, dbResult);
+            TrackCacheStats(cacheKey, result);
 
-            if (!string.IsNullOrWhiteSpace(dbResult))
-            {
-                CacheStats.OnHit();
-
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Hit : cachekey = {cacheKey}");
-
-                return new CacheValue<T>(Newtonsoft.Json.JsonConvert.DeserializeObject<T>(dbResult), true);
-            }
-            else
-            {
-                CacheStats.OnMiss();
-
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Missed : cachekey = {cacheKey}");
-
-                return CacheValue<T>.NoValue;
-            }
+            return result;
         }
 
         /// <summary>
@@ -155,19 +132,13 @@
 
             if (!string.IsNullOrWhiteSpace(dbResult))
             {
-                CacheStats.OnHit();
-
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Hit : cachekey = {cacheKey}");
+                OnCacheHit(cacheKey);
 
                 return Newtonsoft.Json.JsonConvert.DeserializeObject(dbResult, type);
             }
             else
             {
-                CacheStats.OnMiss();
-
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Missed : cachekey = {cacheKey}");
+                OnCacheMiss(cacheKey);
 
                 return null;
             }
@@ -222,8 +193,7 @@
         {
             ArgumentCheck.NotNullOrWhiteSpace(prefix, nameof(prefix));
 
-            if (_options.EnableLogging)
-                _logger?.LogInformation($"RemoveByPrefixAsync : prefix = {prefix}");
+            Logger?.LogInformation("RemoveByPrefixAsync : prefix = {0}", prefix);
 
             await _cache.ExecuteAsync(ConstSQL.REMOVEBYPREFIXSQL, new { cachekey = string.Concat(prefix, "%"), name = _name });
         }

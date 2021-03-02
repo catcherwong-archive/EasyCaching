@@ -27,8 +27,7 @@
         /// <returns>The async.</returns>
         public override async Task BaseFlushAsync()
         {
-            if (_options.EnableLogging)
-                _logger?.LogInformation("Redis -- FlushAsync");
+            Logger?.LogInformation("Redis -- FlushAsync");
 
             await _cache.NodesServerManager.FlushDbAsync();
         }
@@ -48,13 +47,10 @@
             //maybe we should use mget here based on redis mode
             //multiple keys may trigger `don't hash to the same slot`
 
-            foreach (var item in cacheKeys)
+            foreach (var cacheKey in cacheKeys)
             {
-                var cachedValue = await _cache.GetAsync<byte[]>(item);
-                if (cachedValue != null)
-                    result.Add(item, new CacheValue<T>(_serializer.Deserialize<T>(cachedValue), true));
-                else
-                    result.Add(item, CacheValue<T>.NoValue);
+                var redisValue = await _cache.GetAsync<byte[]>(cacheKey);
+                result.Add(cacheKey, Deserialize<T>(cacheKey, redisValue));
             }
 
             return result;
@@ -73,22 +69,12 @@
             ArgumentCheck.NotNullOrWhiteSpace(cacheKey, nameof(cacheKey));
             ArgumentCheck.NotNegativeOrZero(expiration, nameof(expiration));
 
-            var result = await _cache.GetAsync<byte[]>(cacheKey);
-            if (result != null || _options.CacheNulls)
-            {
-                CacheStats.OnHit();
-
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Hit : cachekey = {cacheKey}");
-
-                var value = _serializer.Deserialize<T>(result);
-                return new CacheValue<T>(value, true);
-            }
-
-            CacheStats.OnMiss();
-
-            if (_options.EnableLogging)
-                _logger?.LogInformation($"Cache Missed : cachekey = {cacheKey}");
+            var redisValue = await _cache.GetAsync<byte[]>(cacheKey);
+            var result = Deserialize<T>(cacheKey, redisValue);
+            TrackCacheStats(cacheKey, result);
+            
+            if (result.HasValue)
+                return result;
 
             var flag = await _cache.SetAsync($"{cacheKey}_Lock", 1, (int)TimeSpan.FromMilliseconds(_options.LockMs).TotalSeconds, RedisExistence.Nx);
 
@@ -104,14 +90,16 @@
                 await SetAsync(cacheKey, item, expiration);
                 //remove mutex key
                 await _cache.DelAsync($"{cacheKey}_Lock");
-                return new CacheValue<T>(item, true);
+                result = new CacheValue<T>(item, true);
             }
             else
             {
                 //remove mutex key
                 await _cache.DelAsync($"{cacheKey}_Lock");
-                return CacheValue<T>.NoValue;
+                result = CacheValue<T>.NoValue;
             }
+
+            return result;
         }
 
         /// <summary>
@@ -127,20 +115,14 @@
             var result = await _cache.GetAsync<byte[]>(cacheKey);
             if (result != null)
             {
-                CacheStats.OnHit();
-
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Hit : cachekey = {cacheKey}");
+                OnCacheHit(cacheKey);
 
                 var value = _serializer.Deserialize(result, type);
                 return value;
             }
             else
             {
-                CacheStats.OnMiss();
-
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Missed : cachekey = {cacheKey}");
+                OnCacheMiss(cacheKey);
 
                 return null;
             }
@@ -156,26 +138,11 @@
         {
             ArgumentCheck.NotNullOrWhiteSpace(cacheKey, nameof(cacheKey));
 
-            var result = await _cache.GetAsync<byte[]>(cacheKey);
-            if (result != null)
-            {
-                CacheStats.OnHit();
-
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Hit : cachekey = {cacheKey}");
-
-                var value = _serializer.Deserialize<T>(result);
-                return new CacheValue<T>(value, true);
-            }
-            else
-            {
-                CacheStats.OnMiss();
-
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Missed : cachekey = {cacheKey}");
-
-                return CacheValue<T>.NoValue;
-            }
+            var redisValue = await _cache.GetAsync<byte[]>(cacheKey);
+            var result = Deserialize<T>(cacheKey, redisValue);
+            TrackCacheStats(cacheKey, result);
+            
+            return result;
         }
 
         /// <summary>
@@ -218,13 +185,10 @@
 
             var result = new Dictionary<string, CacheValue<T>>();
 
-            foreach (var item in redisKeys)
+            foreach (var cacheKey in redisKeys)
             {
-                var cachedValue = await _cache.GetAsync<byte[]>(item);
-                if (cachedValue != null)
-                    result.Add(item, new CacheValue<T>(_serializer.Deserialize<T>(cachedValue), true));
-                else
-                    result.Add(item, CacheValue<T>.NoValue);
+                var redisValue = await _cache.GetAsync<byte[]>(cacheKey);
+                result.Add(cacheKey, Deserialize<T>(cacheKey, redisValue));
             }
 
             return result;
@@ -272,8 +236,7 @@
 
             prefix = this.HandlePrefix(prefix);
 
-            if (_options.EnableLogging)
-                _logger?.LogInformation($"RemoveByPrefixAsync : prefix = {prefix}");
+            Logger?.LogInformation("RemoveByPrefixAsync : prefix = {0}", prefix);
 
             var redisKeys = this.SearchRedisKeys(prefix);
 

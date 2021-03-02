@@ -1,16 +1,18 @@
-﻿namespace Microsoft.Extensions.DependencyInjection
+﻿namespace EasyCaching.CSRedis
 {
     using System;
     using EasyCaching.Core;
     using EasyCaching.Core.Configurations;
-    using EasyCaching.CSRedis;
+    using global::CSRedis;
     using Microsoft.Extensions.Configuration;
 
     /// <summary>
     /// EasyCaching options extensions.
     /// </summary>
-    public static class EasyCachingOptionsExtensions
+    public static class CSRedisOptionsExtensions
     {
+        public static Func<Exception, bool> RedisExceptionFilter { get; } = exception => exception is RedisClientException;
+        
         /// <summary>
         /// Uses the CSRedis provider (specify the config via hard code).
         /// </summary>

@@ -8,7 +8,7 @@
     using global::CSRedis;
     using Microsoft.Extensions.Logging;
 
-    public partial class DefaultCSRedisCachingProvider : EasyCachingAbstractProvider
+    public partial class DefaultCSRedisCachingProvider : EasyCachingAbstractProvider, IRedisAndEasyCachingProvider
     {
         /// <summary>
         /// The cache.
@@ -19,11 +19,6 @@
         /// The serializer.
         /// </summary>
         private readonly IEasyCachingSerializer _serializer;
-
-        /// <summary>
-        /// The logger.
-        /// </summary>
-        private readonly ILogger _logger;
 
         /// <summary>
         /// The options.
@@ -62,7 +57,12 @@
         {
             this._name = name;
             this._options = options;
-            this._logger = loggerFactory?.CreateLogger<DefaultCSRedisCachingProvider>();
+
+            if (options.EnableLogging)
+            {
+                this.Logger = loggerFactory.CreateLogger<DefaultCSRedisCachingProvider>();
+            }
+            
             this._cache = clients.Single(x => x.Name.Equals(_name));
             this._cacheStats = new CacheStats();
 
@@ -74,13 +74,11 @@
             this.ProviderType = CachingProviderType.Redis;
             this.ProviderStats = this._cacheStats;
             this.ProviderMaxRdSecond = _options.MaxRdSecond;
-            this.IsDistributedProvider = true;
 
             _info = new ProviderInfo
             {
                 CacheStats = _cacheStats,
                 EnableLogging = options.EnableLogging,
-                IsDistributedProvider = IsDistributedProvider,
                 LockMs = options.LockMs,
                 MaxRdSecond = options.MaxRdSecond,
                 ProviderName = ProviderName,
@@ -109,8 +107,7 @@
         /// </summary>
         public override void BaseFlush()
         {
-            if (_options.EnableLogging)
-                _logger?.LogInformation("Redis -- Flush");
+            Logger?.LogInformation("Redis -- Flush");
 
             _cache.NodesServerManager.FlushDb();
         }
@@ -128,22 +125,12 @@
             ArgumentCheck.NotNullOrWhiteSpace(cacheKey, nameof(cacheKey));
             ArgumentCheck.NotNegativeOrZero(expiration, nameof(expiration));
 
-            var result = _cache.Get<byte[]>(cacheKey);
-            if (result != null)
-            {
-                CacheStats.OnHit();
+            var redisValue = _cache.Get<byte[]>(cacheKey);
+            var result = Deserialize<T>(cacheKey, redisValue);
+            TrackCacheStats(cacheKey, result);
 
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Hit : cachekey = {cacheKey}");
-
-                var value = _serializer.Deserialize<T>(result);
-                return new CacheValue<T>(value, true);
-            }
-
-            CacheStats.OnMiss();
-
-            if (_options.EnableLogging)
-                _logger?.LogInformation($"Cache Missed : cachekey = {cacheKey}");
+            if (result.HasValue)
+                return result;
 
             if (!_cache.Set($"{cacheKey}_Lock", 1, (int)TimeSpan.FromMilliseconds(_options.LockMs).TotalSeconds, RedisExistence.Nx))
             {
@@ -157,14 +144,16 @@
                 Set(cacheKey, item, expiration);
                 //remove mutex key
                 _cache.Del($"{cacheKey}_Lock");
-                return new CacheValue<T>(item, true);
+                result = new CacheValue<T>(item, true);
             }
             else
             {
                 //remove mutex key
                 _cache.Del($"{cacheKey}_Lock");
-                return CacheValue<T>.NoValue;
+                result = CacheValue<T>.NoValue;
             }
+
+            return result;
         }
 
         /// <summary>
@@ -177,26 +166,11 @@
         {
             ArgumentCheck.NotNullOrWhiteSpace(cacheKey, nameof(cacheKey));
 
-            var result = _cache.Get<byte[]>(cacheKey);
-            if (result != null)
-            {
-                CacheStats.OnHit();
-
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Hit : cachekey = {cacheKey}");
-
-                var value = _serializer.Deserialize<T>(result);
-                return new CacheValue<T>(value, true);
-            }
-            else
-            {
-                CacheStats.OnMiss();
-
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Missed : cachekey = {cacheKey}");
-
-                return CacheValue<T>.NoValue;
-            }
+            var redisValue = _cache.Get<byte[]>(cacheKey);
+            var result = Deserialize<T>(cacheKey, redisValue);
+            TrackCacheStats(cacheKey, result);
+            
+            return result;
         }
 
         /// <summary>
@@ -214,13 +188,10 @@
             //maybe we should use mget here based on redis mode
             //multiple keys may trigger `don't hash to the same slot`
 
-            foreach (var item in cacheKeys)
+            foreach (var cacheKey in cacheKeys)
             {
-                var cachedValue = _cache.Get<byte[]>(item);
-                if (cachedValue != null)
-                    result.Add(item, new CacheValue<T>(_serializer.Deserialize<T>(cachedValue), true));
-                else
-                    result.Add(item, CacheValue<T>.NoValue);
+                var redisValue = _cache.Get<byte[]>(cacheKey);
+                result.Add(cacheKey, Deserialize<T>(cacheKey, redisValue));
             }
 
             return result;
@@ -285,13 +256,10 @@
 
             var result = new Dictionary<string, CacheValue<T>>();
 
-            foreach (var item in redisKeys)
+            foreach (var cacheKey in redisKeys)
             {
-                var cachedValue = _cache.Get<byte[]>(item);
-                if (cachedValue != null)
-                    result.Add(item, new CacheValue<T>(_serializer.Deserialize<T>(cachedValue), true));
-                else
-                    result.Add(item, CacheValue<T>.NoValue);
+                var redisValue = _cache.Get<byte[]>(cacheKey);
+                result.Add(cacheKey, Deserialize<T>(cacheKey, redisValue));
             }
 
             return result;
@@ -356,8 +324,7 @@
 
             prefix = this.HandlePrefix(prefix);
 
-            if (_options.EnableLogging)
-                _logger?.LogInformation($"RemoveByPrefix : prefix = {prefix}");
+            Logger?.LogInformation("RemoveByPrefix : prefix = {0}", prefix);
 
             var redisKeys = this.SearchRedisKeys(prefix);
 
@@ -462,6 +429,25 @@
         public override ProviderInfo BaseGetProviderInfo()
         {
             return _info;
+        }
+
+        private CacheValue<T> Deserialize<T>(string cacheKey, byte[] redisValue)
+        {
+            if (redisValue == null)
+            {
+                return CacheValue<T>.NoValue;
+            }
+            
+            try
+            {
+                var value = _serializer.Deserialize<T>(redisValue);
+                return new CacheValue<T>(value, true);
+            }
+            catch (Exception ex)
+            {
+                Logger?.LogWarning(ex, "Error while deserializing cache value with key '{0}'.", cacheKey);
+                return CacheValue<T>.NoValue;
+            }
         }
     }
 }

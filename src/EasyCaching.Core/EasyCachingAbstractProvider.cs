@@ -6,6 +6,7 @@
     using System.Linq;
     using System.Threading.Tasks;
     using EasyCaching.Core.Diagnostics;
+    using Microsoft.Extensions.Logging;
 
     public abstract class EasyCachingAbstractProvider : IEasyCachingProvider
     {
@@ -13,13 +14,13 @@
                     new DiagnosticListener(EasyCachingDiagnosticListenerExtensions.DiagnosticListenerName);
 
         protected string ProviderName { get; set; }
-        protected bool IsDistributedProvider { get; set; }
         protected int ProviderMaxRdSecond { get; set; }
         protected CachingProviderType ProviderType { get; set; }
         protected CacheStats ProviderStats { get; set; }
+        
+        protected ILogger Logger { get; set; }
 
         public string Name => this.ProviderName;
-        public bool IsDistributedCache => this.IsDistributedProvider;
         public int MaxRdSecond => this.ProviderMaxRdSecond;
         public CachingProviderType CachingProviderType => this.ProviderType;
         public CacheStats CacheStats => this.ProviderStats;
@@ -730,6 +731,32 @@
         public ProviderInfo GetProviderInfo()
         {
             return BaseGetProviderInfo();            
+        }
+
+        protected void TrackCacheStats<T>(string cacheKey, CacheValue<T> cacheValue)
+        {
+            if (cacheValue.HasValue)
+            {
+                OnCacheHit(cacheKey);
+            }
+            else
+            {
+                OnCacheMiss(cacheKey);
+            }
+        }
+
+        protected void OnCacheHit(string cacheKey)
+        {
+            CacheStats.OnHit();
+
+            Logger?.LogInformation("Cache Hit : cachekey = {0}", cacheKey);
+        }
+        
+        protected void OnCacheMiss(string cacheKey)
+        {
+            CacheStats.OnMiss();
+
+            Logger?.LogInformation("Cache Missed : cachekey = {0}", cacheKey);
         }
     }
 }
