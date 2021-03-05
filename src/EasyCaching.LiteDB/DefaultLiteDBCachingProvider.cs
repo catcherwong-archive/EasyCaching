@@ -22,11 +22,6 @@
         /// </summary>
         private readonly LiteDBOptions _options;
 
-        /// <summary>
-        /// The logger.
-        /// </summary>
-        private readonly ILogger _logger;
-
         private readonly LiteDatabase _litedb;
 
         /// <summary>
@@ -54,7 +49,12 @@
         {
             this._dbProvider = dbProviders.Single(x => x.DBProviderName.Equals(name));
             this._options = options;
-            this._logger = loggerFactory?.CreateLogger<DefaultLiteDBCachingProvider>();
+
+            if (options.EnableLogging)
+            {
+                this.Logger = loggerFactory.CreateLogger<DefaultLiteDBCachingProvider>();
+            }
+            
             this._litedb = _dbProvider.GetConnection();
             this._cache = _litedb.GetCollection<CacheItem>(name);
             this._cacheStats = new CacheStats();
@@ -64,13 +64,11 @@
             this.ProviderType = CachingProviderType.LiteDB;
             this.ProviderStats = this._cacheStats;
             this.ProviderMaxRdSecond = _options.MaxRdSecond;
-            this.IsDistributedProvider = true;
 
             _info = new ProviderInfo
             {
                 CacheStats = _cacheStats,
                 EnableLogging = options.EnableLogging,
-                IsDistributedProvider = IsDistributedProvider,
                 LockMs = options.LockMs,
                 MaxRdSecond = options.MaxRdSecond,
                 ProviderName = ProviderName,
@@ -157,26 +155,10 @@
 
             var cacheItem = _cache.FindOne(c => c.cachekey == cacheKey && c.expiration > DateTimeOffset.Now.ToUnixTimeSeconds());
 
-            if (cacheItem != null || _options.CacheNulls)
-            {
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Hit : cachekey = {cacheKey}");
+            var result = Deserialize<T>(cacheKey, cacheItem?.cachevalue);
+            TrackCacheStats(cacheKey, result);
 
-                CacheStats.OnHit();
-
-                return string.IsNullOrWhiteSpace(cacheItem?.cachevalue) 
-                    ? CacheValue<T>.Null 
-                    : new CacheValue<T>(Newtonsoft.Json.JsonConvert.DeserializeObject<T>(cacheItem.cachevalue), true);
-            }
-            else
-            {
-                CacheStats.OnMiss();
-
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Missed : cachekey = {cacheKey}");
-
-                return CacheValue<T>.NoValue;
-            }
+            return result;
         }
 
         /// <summary>
@@ -226,8 +208,7 @@
         {
             ArgumentCheck.NotNullOrWhiteSpace(prefix, nameof(prefix));
 
-            if (_options.EnableLogging)
-                _logger?.LogInformation($"RemoveByPrefix : prefix = {prefix}");
+            Logger?.LogInformation("RemoveByPrefix : prefix = {0}", prefix);
 
             _cache.DeleteMany(c => c.cachekey.StartsWith(prefix));
         }
@@ -285,13 +266,10 @@
         /// <typeparam name="T">The 1st type parameter.</typeparam>
         private IDictionary<string, CacheValue<T>> GetDict<T>(List<CacheItem> list)
         {
-            var result = new Dictionary<string, CacheValue<T>>();
+            var result = new Dictionary<string, CacheValue<T>>(list.Count);
             foreach (var item in list)
             {
-                if (!string.IsNullOrWhiteSpace(item.cachekey))
-                    result.Add(item.cachekey, new CacheValue<T>(Newtonsoft.Json.JsonConvert.DeserializeObject<T>(item.cachevalue), true));
-                else
-                    result.Add(item.cachekey, CacheValue<T>.NoValue);
+                result.Add(item.cachekey, Deserialize<T>(item.cachekey, item.cachevalue));
             }
             return result;
         }
@@ -400,6 +378,24 @@
         public override ProviderInfo BaseGetProviderInfo()
         {
             return _info;
+        }
+
+        private CacheValue<T> Deserialize<T>(string cacheKey, string cacheValue)
+        {
+            if (string.IsNullOrWhiteSpace(cacheValue))
+            {
+                return CacheValue<T>.NoValue;
+            }
+            
+            try
+            {
+                return new CacheValue<T>(Newtonsoft.Json.JsonConvert.DeserializeObject<T>(cacheValue), true);
+            }
+            catch (Exception ex)
+            {
+                Logger?.LogWarning(ex, "Error while deserializing cache value with key '{0}'.", cacheKey);
+                return CacheValue<T>.NoValue;
+            }
         }
     }
 }
