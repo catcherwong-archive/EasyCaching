@@ -3,93 +3,170 @@
     using EasyCaching.Bus.Redis;
     using EasyCaching.Core;
     using EasyCaching.Core.Bus;
-    using EasyCaching.HybridCache;
-    using EasyCaching.InMemory;
+    using EasyCaching.Core.Configurations;
+    using EasyCaching.Decoration.Polly;
     using EasyCaching.Redis;
     using Microsoft.Extensions.DependencyInjection;
-    using Microsoft.Extensions.Options;
     using System;
     using System.Threading.Tasks;
     using Xunit;
     using FakeItEasy;
     using System.Threading;
+    using static ServiceBuilders;
 
     public class HybridCachingTest //: BaseCachingProviderTest
     {
-        private string _namespace;
-        private IHybridCachingProvider hybridCaching_1;
-        private IEasyCachingProviderFactory factory;
+        private const string AvailableRedis = "127.0.0.1:6379,abortConnect=true";
+        private const string UnavailableRedis = "127.0.0.1:9999,abortConnect=true,connectTimeout=1";
+        private const string UnavailableRedisWithAbortConnect = "127.0.0.1:9999,abortConnect=false,connectTimeout=1";
+        
+        private const string LocalCacheProviderName = "m1";
+        private const string DistributedCacheProviderName = "myredis";
+        private static readonly TimeSpan Expiration = TimeSpan.FromSeconds(30);
+        
+        private readonly string _nameSpace= "hybrid";
 
-        private HybridCachingProvider fakeHybrid;
-        private IEasyCachingProviderFactory fakeFactory;
-        private IEasyCachingBus fakeBus;
-        private FakeDistributedCachingProvider fakeDisProvider;
-
-        public HybridCachingTest()
+        private void UseHybrid(EasyCachingOptions x)
         {
-            _namespace = "hybrid";
-
-            var options = new HybridCachingOptions
+            x.UseHybrid(options =>
             {
-                EnableLogging = false,
-                TopicName = "test_topic",
-                LocalCacheProviderName = "m1",
-                DistributedCacheProviderName = "myredis",
-                BusRetryCount = 1,
-                DefaultExpirationForTtlFailed = 60
-            };
+                options.EnableLogging = false;
+                options.TopicName = "test_topic";
+                options.LocalCacheProviderName = LocalCacheProviderName;
+                options.DistributedCacheProviderName = DistributedCacheProviderName;
+                options.DefaultExpirationForTtlFailed = 60;
+            });
+        }
 
-            IServiceCollection services = new ServiceCollection();
-            services.AddEasyCaching(option =>
+        private IHybridCachingProvider CreateCachingProvider() => CreateService<IHybridCachingProvider>(services =>
+        {
+            services.AddEasyCaching(x =>
             {
-                option.UseInMemory("m1");
-                option.UseInMemory("m2");
+                x.UseInMemory(LocalCacheProviderName);
 
-                option.UseRedis(config =>
+                x.UseRedis(options =>
                 {
-                    config.DBConfig.Endpoints.Add(new Core.Configurations.ServerEndPoint("127.0.0.1", 6379));
-                    config.DBConfig.Database = 5;
-                }, "myredis");
+                    options.DBConfig.Configuration = AvailableRedis;
+                },
+                DistributedCacheProviderName);
 
-                option.UseHybrid(config =>
+                x.WithRedisBus(options =>
                 {
-                    config.EnableLogging = false;
-                    config.TopicName = "test_topic";
-                    config.LocalCacheProviderName = "m1";
-                    config.DistributedCacheProviderName = "myredis";
+                    options.Configuration = AvailableRedis;
+                    
+                    options
+                        .DecorateWithRetry(1, RedisBusOptionsExtensions.RedisExceptionFilter)
+                        .DecorateWithPublishFallback(RedisBusOptionsExtensions.RedisExceptionFilter);
                 });
 
-                option.WithRedisBus(config =>
+                UseHybrid(x);
+            });
+        });
+
+        private IHybridCachingProvider CreateCachingProviderWithCircuitBreakerAndFallback(string connectionString) => 
+            CreateService<IHybridCachingProvider>(services =>
+            {
+                services.AddEasyCaching(x =>
                 {
-                    config.Endpoints.Add(new Core.Configurations.ServerEndPoint("127.0.0.1", 6379));
-                    config.Database = 6;
+                    x.UseInMemory(LocalCacheProviderName);
+
+                    var circuitBreakerParameters = new CircuitBreakerParameters(
+                        exceptionsAllowedBeforeBreaking: 1,
+                        durationOfBreak: TimeSpan.FromMinutes(1));
+                
+                    x.UseRedis(options =>
+                        {
+                            options.DBConfig.Configuration = connectionString;
+                
+                            options.DecorateWithCircuitBreaker(
+                                initParameters: circuitBreakerParameters,
+                                executeParameters: circuitBreakerParameters,
+                                exceptionFilter: RedisOptionsExtensions.RedisExceptionFilter);
+                        },
+                        DistributedCacheProviderName);
+
+                    x.WithRedisBus(options =>
+                    {
+                        options.Configuration = connectionString;
+                    
+                        options
+                            .DecorateWithCircuitBreaker(
+                                initParameters: circuitBreakerParameters,
+                                executeParameters: circuitBreakerParameters,
+                                subscribeRetryInterval: TimeSpan.FromMinutes(1),
+                                exceptionFilter: RedisOptionsExtensions.RedisExceptionFilter)
+                            .DecorateWithRetry(1, RedisOptionsExtensions.RedisExceptionFilter)
+                            .DecorateWithPublishFallback(RedisOptionsExtensions.RedisExceptionFilter);
+                    });
+
+                    UseHybrid(x);
                 });
             });
+        
+        private IHybridCachingProvider CreateFakeCachingProvider(
+            Action<FakeBusOptions> decorateFakeBus = null,
+            Action<IEasyCachingProvider> setupFakeDistributedProvider = null,
+            Action<IEasyCachingBus> setupFakeBus = null)
+        {
+            var fakeBus = A.Fake<IEasyCachingBus>();
+            setupFakeBus?.Invoke(fakeBus);
+            
+            var fakeDistributedProvider = A.Fake<IEasyCachingProvider>();
+            A.CallTo(() => fakeDistributedProvider.Name).Returns(DistributedCacheProviderName);
+            setupFakeDistributedProvider?.Invoke(fakeDistributedProvider);
 
-            IServiceProvider serviceProvider = services.BuildServiceProvider();
-            factory = serviceProvider.GetService<IEasyCachingProviderFactory>();
+            return CreateService<IHybridCachingProvider>(services =>
+            {
+                services.AddEasyCaching(x =>
+                {
+                    x.UseInMemory(LocalCacheProviderName);
 
-            var bus = serviceProvider.GetService<IEasyCachingBus>();
+                    x.UseFakeProvider(
+                        options =>
+                        {
+                            options.ProviderFactory = () => fakeDistributedProvider;
 
-            hybridCaching_1 = serviceProvider.GetService<IHybridCachingProvider>();
+                            var circuitBreakerParameters = new CircuitBreakerParameters(
+                                exceptionsAllowedBeforeBreaking: 1,
+                                durationOfBreak: TimeSpan.FromMinutes(1));
+                
+                            options.DecorateWithCircuitBreaker(
+                                initParameters: circuitBreakerParameters,
+                                executeParameters: circuitBreakerParameters,
+                                exception => exception is InvalidOperationException);
+                        },
+                        DistributedCacheProviderName);
 
-            fakeBus = A.Fake<IEasyCachingBus>();
-            fakeFactory = A.Fake<IEasyCachingProviderFactory>();
-            fakeDisProvider = A.Fake<FakeDistributedCachingProvider>();
-            var myOptions = Options.Create(options);
-            FakeCreatProvider();
-            fakeHybrid = new HybridCachingProvider("h1", myOptions.Value, fakeFactory, fakeBus);
+                    x.WithFakeBus(options =>
+                    {
+                        options.BusFactory = () => fakeBus;
+
+                        if (decorateFakeBus != null)
+                        {
+                            decorateFakeBus(options);
+                        }
+                        else
+                        {
+                            options
+                                .DecorateWithRetry(retryCount: 1, exceptionFilter: null)
+                                .DecorateWithPublishFallback(exceptionFilter: null);
+                        };
+                    });
+
+                    UseHybrid(x);
+                });
+            });
         }
 
         [Fact]
         public void Set_And_Get_Should_Succeed()
         {
-            var cacheKey = $"{_namespace}_{Guid.NewGuid().ToString()}";
+            var hybridProvider = CreateCachingProvider();
+            var cacheKey = GetUniqueCacheKey();
 
-            hybridCaching_1.Set(cacheKey, "val", TimeSpan.FromSeconds(30));
+            hybridProvider.Set(cacheKey, "val", Expiration);
 
-            var res = hybridCaching_1.Get<string>(cacheKey);
-
+            var res = hybridProvider.Get<string>(cacheKey);
             Assert.Equal("val", res.Value);
         }
 
@@ -97,39 +174,39 @@
         [Fact]
         public async Task SetAsync_And_ExistsAsync_Should_Succeed()
         {
-            var cacheKey = $"{_namespace}_{Guid.NewGuid().ToString()}";
+            var hybridProvider = CreateCachingProvider();
+            var cacheKey = GetUniqueCacheKey();
 
-            await hybridCaching_1.SetAsync(cacheKey, "val", TimeSpan.FromSeconds(30));
+            await hybridProvider.SetAsync(cacheKey, "val", Expiration);
 
-            var res = await hybridCaching_1.ExistsAsync(cacheKey);
-
+            var res = await hybridProvider.ExistsAsync(cacheKey);
             Assert.True(res);
         }
 
         [Fact]
         public void Set_And_Remove_Should_Succeed()
         {
-            var cacheKey = $"{_namespace}_{Guid.NewGuid().ToString()}";
+            var hybridProvider = CreateCachingProvider();
+            var cacheKey = GetUniqueCacheKey();
 
-            hybridCaching_1.Set(cacheKey, "val", TimeSpan.FromSeconds(30));
+            hybridProvider.Set(cacheKey, "val", Expiration);
+            hybridProvider.Remove(cacheKey);
 
-            hybridCaching_1.Remove(cacheKey);
-
-            var res = hybridCaching_1.Exists(cacheKey);
-
+            var res = hybridProvider.Exists(cacheKey);
             Assert.False(res);
         }
 
         [Fact]
         public async Task SetAsync_And_RemoveAsync_Should_Succeed()
         {
-            var cacheKey = $"{_namespace}_{Guid.NewGuid().ToString()}";
+            var hybridProvider = CreateCachingProvider();
+            var cacheKey = GetUniqueCacheKey();
 
-            await hybridCaching_1.SetAsync(cacheKey, "val", TimeSpan.FromSeconds(30));
+            await hybridProvider.SetAsync(cacheKey, "val", Expiration);
 
-            await hybridCaching_1.RemoveAsync(cacheKey);
+            await hybridProvider.RemoveAsync(cacheKey);
 
-            var res = await hybridCaching_1.ExistsAsync(cacheKey);
+            var res = await hybridProvider.ExistsAsync(cacheKey);
 
             Assert.False(res);
         }
@@ -137,15 +214,16 @@
         [Fact(Skip = "Delay")]
         public void Second_Client_Set_Same_Key_Should_Get_New_Value()
         {
-            var cacheKey = $"{_namespace}_{Guid.NewGuid().ToString()}";
+            var hybridProvider = CreateCachingProvider();
+            var cacheKey = GetUniqueCacheKey();
 
-            hybridCaching_1.Set(cacheKey, "val", TimeSpan.FromSeconds(30));
+            hybridProvider.Set(cacheKey, "val", Expiration);
 
-            //hybridCaching_2.Set(cacheKey, "value", TimeSpan.FromSeconds(30));
+            //hybridCaching_2.Set(cacheKey, "value", Expiration);
 
             //System.Threading.Thread.Sleep(5000);
 
-            var res = hybridCaching_1.Get<string>(cacheKey);
+            var res = hybridProvider.Get<string>(cacheKey);
 
             Assert.Equal("value", res.Value);
         }
@@ -153,9 +231,11 @@
         [Fact]
         public void Send_Msg_Throw_Exception_Should_Not_Break()
         {
-            A.CallTo(() => fakeBus.Publish("test_topic", A<EasyCachingMessage>._)).Throws((arg) => new Exception());
+            var hybridProvider = CreateFakeCachingProvider(
+                setupFakeBus: bus => 
+                    A.CallTo(() => bus.Publish("test_topic", A<EasyCachingMessage>._)).Throws(new InvalidOperationException()));
 
-            fakeHybrid.Remove("fake-remove");
+            hybridProvider.Remove("fake-remove");
 
             Assert.True(true);
         }
@@ -163,68 +243,148 @@
         [Fact]
         public async Task Send_Msg_Async_Throw_Exception_Should_Not_Break()
         {
-            CancellationToken token = new CancellationToken();
-            A.CallTo(() => fakeBus.PublishAsync("test_topic", A<EasyCachingMessage>._, token)).ThrowsAsync((arg) => new Exception());
+            var token = new CancellationToken();
+            var hybridProvider = CreateFakeCachingProvider(
+                setupFakeBus: bus => 
+                    A.CallTo(() => bus.PublishAsync("test_topic", A<EasyCachingMessage>._, token)).ThrowsAsync(new InvalidOperationException()));
 
-            await fakeHybrid.RemoveAsync("fake-remove");
+            await hybridProvider.RemoveAsync("fake-remove");
+
+            Assert.True(true);
+        }
+
+        [Fact]
+        public void Subscribe_With_Circuit_Breaker_Subscribe_Exception_Should_Not_Break()
+        {
+            var circuitBreakerParameters = new CircuitBreakerParameters(
+                exceptionsAllowedBeforeBreaking: 1,
+                durationOfBreak: TimeSpan.FromMinutes(1));
+            var hybridProvider = CreateFakeCachingProvider(
+                decorateFakeBus: options => options.DecorateWithCircuitBreaker(
+                    initParameters: circuitBreakerParameters,
+                    executeParameters: circuitBreakerParameters,
+                    subscribeRetryInterval: TimeSpan.FromMinutes(1),
+                    exceptionFilter: exception => exception is InvalidOperationException),
+                setupFakeBus: bus => 
+                    A.CallTo(() => bus.Subscribe("test_topic", A<Action<EasyCachingMessage>>._)).Throws(new InvalidOperationException())
+            );
+
+            hybridProvider.RemoveAsync("fake-remove");
 
             Assert.True(true);
         }
               
-        [Fact]
-        public void Distributed_Remove_Throw_Exception_Should_Not_Break()
+        [Theory]
+        [InlineData(1)]
+        [InlineData(2)]
+        public void Distributed_Remove_Throw_Exception_Should_Not_Break(int attemptsCount)
         {
-            A.CallTo(() => fakeDisProvider.Remove("fake-remove-key")).Throws(new Exception());
+            var hybridProvider = CreateFakeCachingProvider(
+                    setupFakeDistributedProvider: distributedProvider => 
+                        A.CallTo(() => distributedProvider.Remove("fake-remove-key")).Throws(new InvalidOperationException()));
 
-            fakeHybrid.Remove("fake-remove-key");
+
+            for (int i = 0; i < attemptsCount; i++)
+            {
+                hybridProvider.Remove("fake-remove-key");
+            }
+            
 
             Assert.True(true);
         }
 
-        [Fact]
-        public async Task Distributed_Remove_Async_Throw_Exception_Should_Not_Break()
+        [Theory]
+        [InlineData(1)]
+        [InlineData(2)]
+        public async Task Distributed_Remove_Async_Throw_Exception_Should_Not_Break(int attemptsCount)
         {
-            A.CallTo(() => fakeDisProvider.RemoveAsync("fake-remove-key")).ThrowsAsync(new Exception());
+            var hybridProvider = CreateFakeCachingProvider(
+                setupFakeDistributedProvider: distributedProvider => 
+                    A.CallTo(() => distributedProvider.RemoveAsync("fake-remove-key")).ThrowsAsync(new InvalidOperationException()));
 
-            await fakeHybrid.RemoveAsync("fake-remove-key");
+
+            for (int i = 0; i < attemptsCount; i++)
+            {
+                await hybridProvider.RemoveAsync("fake-remove-key");
+            }
 
             Assert.True(true);
         }
 
-        [Fact]
-        public void Distributed_Set_Throw_Exception_Should_Not_Break()
+        [Theory]
+        [InlineData(1)]
+        [InlineData(2)]
+        public void Distributed_Set_Throw_Exception_Should_Not_Break(int attemptsCount)
         {
-            A.CallTo(() => fakeDisProvider.Set(A<string>.Ignored, A<string>.Ignored, A<TimeSpan>.Ignored)).Throws(new Exception());
+            var hybridProvider = CreateFakeCachingProvider(
+                setupFakeDistributedProvider: distributedProvider => 
+                    A.CallTo(() => distributedProvider.Set(A<string>.Ignored, A<string>.Ignored, A<TimeSpan>.Ignored)).Throws(new InvalidOperationException()));
 
-            var key = $"d-set-{Guid.NewGuid().ToString()}";
+            var key = GetUniqueCacheKey();
+            
+            
+            for (int i = 0; i < attemptsCount; i++)
+            {
+                hybridProvider.Set(key, "123", Expiration);
+            }
+            
 
-            fakeHybrid.Set(key, "123", TimeSpan.FromSeconds(30));
-
-            var res = fakeHybrid.Get<string>(key);
+            var res = hybridProvider.Get<string>(key);
 
             Assert.True(res.HasValue);
-            Assert.Equal(default(string), res.Value);
+            Assert.Equal("123", res.Value);
         }
 
-        [Fact]
-        public async Task Distributed_Set_Async_Throw_Exception_Should_Not_Break()
+        [Theory]
+        [InlineData(1)]
+        [InlineData(2)]
+        public async Task Distributed_Set_Async_Throw_Exception_Should_Not_Break(int attemptsCount)
         {
-            A.CallTo(() => fakeDisProvider.SetAsync(A<string>.Ignored, A<string>.Ignored, A<TimeSpan>.Ignored)).ThrowsAsync(new Exception());
+            var hybridProvider = CreateFakeCachingProvider(
+                setupFakeDistributedProvider: distributedProvider => 
+                    A.CallTo(() => distributedProvider.SetAsync(A<string>.Ignored, A<string>.Ignored, A<TimeSpan>.Ignored)).ThrowsAsync(new InvalidOperationException()));
 
-            var key = $"d-set-{Guid.NewGuid().ToString()}";
+            var key = GetUniqueCacheKey();
+            
+            
+            for (int i = 0; i < attemptsCount; i++)
+            {
+                await hybridProvider.SetAsync(key, "123", Expiration);
+            }
+            
 
-            await fakeHybrid.SetAsync(key, "123", TimeSpan.FromSeconds(30));
-
-            var res = await fakeHybrid.GetAsync<string>(key);
+            var res = await hybridProvider.GetAsync<string>(key);
 
             Assert.True(res.HasValue);
-            Assert.Equal(default(string), res.Value);
+            Assert.Equal("123", res.Value);
         }
+        
+        private string GetUniqueCacheKey() => $"{_nameSpace}{Guid.NewGuid().ToString()}";
 
-        private void FakeCreatProvider()
+        [Theory]
+        [InlineData(AvailableRedis, 1)]
+        [InlineData(AvailableRedis, 2)]
+        [InlineData(UnavailableRedis, 1)]
+        [InlineData(UnavailableRedis, 2)]
+        [InlineData(UnavailableRedisWithAbortConnect, 1)]
+        [InlineData(UnavailableRedisWithAbortConnect, 2)]
+        public void Distributed_Set_RedisWithCircuitBreakerAndFallback_Should_Not_Break(string connectionString, int attemptsCount)
         {
-            A.CallTo(() => fakeFactory.GetCachingProvider("m1")).Returns(new FakeLocalCachingProvider());
-            A.CallTo(() => fakeFactory.GetCachingProvider("myredis")).Returns(fakeDisProvider);
+            var hybridProvider = CreateCachingProviderWithCircuitBreakerAndFallback(connectionString);
+
+            var key = GetUniqueCacheKey();
+            
+            
+            for (int i = 0; i < attemptsCount; i++)
+            {
+                hybridProvider.Set(key, "123", Expiration);
+            }
+            
+
+            var res = hybridProvider.Get<string>(key);
+
+            Assert.True(res.HasValue);
+            Assert.Equal("123", res.Value);
         }
     }
 }

@@ -1,16 +1,23 @@
-﻿namespace Microsoft.Extensions.DependencyInjection
+﻿namespace EasyCaching.Bus.Redis
 {
     using System;
-    using EasyCaching.Bus.Redis;
     using EasyCaching.Core;
     using EasyCaching.Core.Configurations;
     using Microsoft.Extensions.Configuration;
+    using StackExchange.Redis;
+    using System.Threading.Tasks;
 
     /// <summary>
     /// EasyCaching options extensions.
     /// </summary>
-    public static class EasyCachingOptionsExtensions
+    public static class RedisBusOptionsExtensions
     {
+        public static Func<Exception, bool> RedisExceptionFilter { get; } = exception =>
+            exception is RedisException ||
+            exception is RedisCommandException || // Derived not from RedisException
+            exception is TimeoutException || // Can be thrown on timeout in Redis is some cases, RedisTimeoutException is derived from TimeoutException
+            exception is TaskCanceledException; // Can be thrown while waiting for Redis response
+
         /// <summary>
         /// Withs the SERedis bus (specify the config via hard code).
         /// </summary>

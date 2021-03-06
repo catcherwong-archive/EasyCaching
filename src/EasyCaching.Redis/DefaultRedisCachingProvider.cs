@@ -11,7 +11,7 @@
     /// <summary>
     /// Default redis caching provider.
     /// </summary>
-    public partial class DefaultRedisCachingProvider : EasyCachingAbstractProvider
+    public partial class DefaultRedisCachingProvider : EasyCachingAbstractProvider, IRedisAndEasyCachingProvider
     {
         /// <summary>
         /// The cache.
@@ -89,13 +89,11 @@
             this.ProviderType = CachingProviderType.Redis;
             this.ProviderStats = this._cacheStats;
             this.ProviderMaxRdSecond = _options.MaxRdSecond;
-            this.IsDistributedProvider = true;
 
             _info = new ProviderInfo
             {
                 CacheStats = _cacheStats,
                 EnableLogging = options.EnableLogging,
-                IsDistributedProvider = IsDistributedProvider,
                 LockMs = options.LockMs,
                 MaxRdSecond = options.MaxRdSecond,
                 ProviderName = ProviderName,
