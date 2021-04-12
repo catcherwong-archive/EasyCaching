@@ -21,11 +21,6 @@
         private readonly DiskOptions _options;
 
         /// <summary>
-        /// The logger.
-        /// </summary>
-        private readonly ILogger _logger;
-
-        /// <summary>
         /// The cache stats.
         /// </summary>
         private readonly CacheStats _cacheStats;
@@ -47,7 +42,11 @@
         {
             this._name = name;
             this._options = options;
-            this._logger = loggerFactory?.CreateLogger<DefaultDiskCachingProvider>();
+
+            if (options.EnableLogging)
+            {
+                this.Logger = loggerFactory.CreateLogger<DefaultDiskCachingProvider>();
+            }
 
             this._cacheKeysMap = new ConcurrentDictionary<string, string>();
 
@@ -57,13 +56,11 @@
             this.ProviderType = CachingProviderType.Disk;
             this.ProviderStats = _cacheStats;
             this.ProviderMaxRdSecond = _options.MaxRdSecond;
-            this.IsDistributedProvider = false;
 
             _info = new ProviderInfo
             {
                 CacheStats = _cacheStats,
                 EnableLogging = options.EnableLogging,
-                IsDistributedProvider = IsDistributedProvider,
                 LockMs = options.LockMs,
                 MaxRdSecond = options.MaxRdSecond,
                 ProviderName = ProviderName,
@@ -124,9 +121,9 @@
 
                         break;
                     }
-                    catch
+                    catch (Exception exception)
                     {
-
+                        Logger?.LogError(exception, "Cache error");
                     }
                 }
             }
@@ -156,9 +153,9 @@
 
                     break;
                 }
-                catch
+                catch (Exception exception)
                 {
-
+                    Logger?.LogError(exception, "Cache error");
                 }
             }
         }
@@ -178,8 +175,7 @@
 
         public override void BaseFlush()
         {
-            if (_options.EnableLogging)
-                _logger?.LogInformation("Flush");
+            Logger?.LogDebug("Flush");
 
             var md5FolderName = GetMd5Str(_name);
 
@@ -205,19 +201,13 @@
                 {
                     var t = MessagePackSerializer.Deserialize<T>(cached.Value, MessagePackSerializerOptions.Standard.WithResolver(ContractlessStandardResolver.Instance));
 
-                    if (_options.EnableLogging)
-                        _logger?.LogInformation($"Cache Hit : cachekey = {cacheKey}");
-
-                    CacheStats.OnHit();
+                    OnCacheMiss(cacheKey);
 
                     return new CacheValue<T>(t, true);
                 }
             }
 
-            CacheStats.OnMiss();
-
-            if (_options.EnableLogging)
-                _logger?.LogInformation($"Cache Missed : cachekey = {cacheKey}");
+            OnCacheMiss(cacheKey);
 
             // TODO: how to add mutex key here
             if (!_cacheKeysMap.TryAdd($"{cacheKey}_Lock", "1"))
@@ -252,10 +242,7 @@
 
             if (!File.Exists(path))
             {
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Missed : cachekey = {cacheKey}");
-
-                CacheStats.OnMiss();
+                OnCacheMiss(cacheKey);
 
                 return CacheValue<T>.NoValue;
             }
@@ -264,20 +251,14 @@
 
             if (cached.Expiration > DateTimeOffset.UtcNow)
             {
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Hit : cachekey = {cacheKey}");
-
-                CacheStats.OnHit();
+                OnCacheMiss(cacheKey);
 
                 var t = MessagePackSerializer.Deserialize<T>(cached.Value, MessagePackSerializerOptions.Standard.WithResolver(ContractlessStandardResolver.Instance));
                 return new CacheValue<T>(t, true);
             }
             else
             {
-                if (_options.EnableLogging)
-                    _logger?.LogInformation($"Cache Missed : cachekey = {cacheKey}");
-
-                CacheStats.OnMiss();
+                OnCacheMiss(cacheKey);
 
                 return CacheValue<T>.NoValue;
             }
@@ -498,9 +479,9 @@
 
                     AppendKey(item.Key, fileName);
                 }
-                catch
+                catch (Exception exception)
                 {
-
+                    Logger?.LogError(exception, "Cache error");
                 }
             }
         }
@@ -586,9 +567,9 @@
                     flag = true;
                     break;
                 }
-                catch
+                catch (Exception exception)
                 {
-                    //return false;
+                    Logger?.LogError(exception, "Cache error");
                 }
             }
 
@@ -657,9 +638,9 @@
                     }
                 }
             }
-            catch
+            catch (Exception exception)
             {
-
+                Logger?.LogError(exception, "Cache error");
             }
         }
 
